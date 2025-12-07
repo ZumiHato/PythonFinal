@@ -1,0 +1,457 @@
+import sqlite3                                # SQLite DB access
+from tabulate import tabulate                 # Pretty-print tables in console
+import matplotlib.pyplot as plt               # Plotting library
+from collections import Counter               # Counting helper for analytics
+import datetime                               # Date utilities for generating weeks
+import re                                     # Regular expressions for validation
+
+# -------------------------------
+# Utility helpers
+# -------------------------------
+def connect_db(db_name="student_schedule.db"): # Open or create the SQLite database file
+    return sqlite3.connect(db_name)            # Return a DB connection object
+
+def safe_table_name(name):                     # Sanitize table names for SQL safety
+    """Allow only alphanumeric and underscore for table names.""" 
+    return "".join(ch for ch in name if ch.isalnum() or ch == "_")  # Strip unsafe chars
+
+def is_valid_student_table_name(name):         # Lightweight validator for naming rule
+    """
+    Validate student table name rule: studentname+ID (e.g., Mary20254512).
+    Basic check: starts with letters then digits.
+    """
+    return bool(re.match(r"^[A-Za-z]+[0-9]+$", name))  # True if matches pattern
+
+def get_all_tables(conn):                      # Return list of all table names in DB
+    cur = conn.cursor()                         # Create a cursor for queries
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")  # Query schema
+    return [r[0] for r in cur.fetchall()]       # Extract names from rows
+
+# -------------------------------
+# Schema documentation (for reference)
+# Each student table must be named studentname+ID (e.g., Mary20254512)
+# Columns and types:
+#   Date_time_slot   TEXT    Format: YYYY-MM-DD-XX  (XX in {12,34,56,78})
+#   course_name      TEXT
+#   course_credits   REAL
+#   teacher_name     TEXT
+#   classroom_id     TEXT
+#   spending         REAL
+#   other_activities TEXT
+# -------------------------------
+
+# -------------------------------
+# Database Module
+# -------------------------------
+def create_table(conn, table_name):            # Create student table if missing
+    t = safe_table_name(table_name)            # Sanitize table name
+    cursor = conn.cursor()                     # Get DB cursor
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS {t} (
+        Date_time_slot TEXT,
+        course_name TEXT,
+        course_credits REAL,
+        teacher_name TEXT,
+        classroom_id TEXT,
+        spending REAL,
+        other_activities TEXT
+    )
+    """)                                       # Execute CREATE TABLE statement
+    conn.commit()                              # Persist schema change
+
+def fetch_all(conn, table_name):               # Fetch all rows ordered by Date_time_slot
+    t = safe_table_name(table_name)            # Sanitize table name
+    cur = conn.cursor()                        # Cursor for query
+    cur.execute(f"SELECT * FROM {t} ORDER BY Date_time_slot")  # Select all rows
+    return cur.fetchall()                      # Return list of tuples
+
+def display_table(conn, table_name):           # Pretty-print a table to console
+    t = safe_table_name(table_name)            # Sanitize table name
+    cursor = conn.cursor()                     # Cursor for query
+    cursor.execute(f"SELECT * FROM {t} ORDER BY Date_time_slot")  # Fetch rows
+    rows = cursor.fetchall()                   # Store rows
+    headers = ["Date_time_slot","course_name","course_credits","teacher_name","classroom_id","spending","other_activities"]  # Column headers
+    print(tabulate(rows, headers=headers, tablefmt="grid"))  # Print formatted table
+
+def insert_rows(conn, table_name, rows):       # Batch-insert multiple rows
+    t = safe_table_name(table_name)            # Sanitize table name
+    cursor = conn.cursor()                     # Cursor for insertion
+    cursor.executemany(f"""
+    INSERT INTO {t} 
+    (Date_time_slot, course_name, course_credits, teacher_name, classroom_id, spending, other_activities)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, rows)                                 # Parameterized bulk insert
+    conn.commit()                              # Commit inserted rows
+
+# -------------------------------
+# Prepopulate helper: generate Mon-Fri x 4 slots (20 rows)
+# -------------------------------
+def generate_week_rows(start_date):            # Build 20 example rows starting from Monday
+    """
+    start_date: datetime.date for Monday of the week
+    returns list of 20 rows (Mon-Fri x 4 slots)
+    Date_time_slot format: YYYY-MM-DD-XX where XX in {12,34,56,78}
+    """
+    slots = ["12", "34", "56", "78"]           # Four period codes per day
+    # Example course pool (used to populate rows)
+    courses = [
+        ("Python Programming", 1.5, "Bob Wang", "N416", 268, "reading"),
+        ("Data Science", 2.0, "Alice Chen", "N210", 320, "learning"),
+        ("Math Analysis", 1.0, "John Lee", "N105", 150, "sleeping"),
+        ("English Writing", 1.5, "Mary Liu", "N305", 200, "reading"),
+        ("Database Systems", 1.5, "Tom Zhang", "N201", 180, "review"),
+        ("Computer Networks", 1.0, "Lina Wu", "N110", 220, "lab"),
+        ("Algorithms", 2.0, "Sam Park", "N307", 250, "practice"),
+        ("Software Eng", 1.5, "Nina Ho", "N402", 300, "project")
+    ]                                          # Each tuple: (course_name, credits, teacher, classroom, spending, activity)
+    rows = []                                  # Output list
+    course_index = 0                           # Index to cycle through courses
+    for day_offset in range(5):                # Loop Monday through Friday
+        day = start_date + datetime.timedelta(days=day_offset)  # Compute date
+        day_str = day.strftime("%Y-%m-%d")     # Format date portion
+        for slot in slots:                     # For each time slot
+            course = courses[course_index % len(courses)]  # Pick course cyclically
+            course_index += 1                  # Advance index
+            date_time_slot = f"{day_str}-{slot}"  # Build Date_time_slot string
+            course_name, credits, teacher, classroom, spending, activity = course  # Unpack
+            rows.append((date_time_slot, course_name, credits, teacher, classroom, spending, activity))  # Append row
+    return rows                                 # Return 20 rows
+
+def ensure_minimum_rows(conn, table_name):      # Ensure table has at least 20 rows
+    """
+    Ensure the given student table has at least 20 rows (Mon-Fri x 4).
+    If fewer than 20 rows exist, prepopulate using the most recent Monday.
+    """
+    t = safe_table_name(table_name)             # Sanitize table name
+    cur = conn.cursor()                         # Cursor for count query
+    cur.execute(f"SELECT COUNT(*) FROM {t}")    # Count existing rows
+    count = cur.fetchone()[0] or 0              # Get count (treat None as 0)
+    if count >= 20:                             # If already sufficient
+        return False                            # No insertion performed
+    today = datetime.date.today()               # Current date
+    monday = today - datetime.timedelta(days=today.weekday())  # Most recent Monday
+    rows = generate_week_rows(monday)           # Generate 20 rows
+    insert_rows(conn, t, rows)                  # Insert into table
+    return True                                 # Indicate insertion occurred
+
+# -------------------------------
+# Interactive Module
+# -------------------------------
+def insert_record(conn, table_name):            # Insert a single record interactively
+    t = safe_table_name(table_name)             # Sanitize table name
+    cursor = conn.cursor()                      # Cursor for insert
+    date_time_slot = input("Enter Date_time_slot (YYYY-MM-DD-XX): ").strip()  # Prompt user
+    course_name = input("Enter course name: ").strip()  # Prompt course name
+    course_credits = float(input("Enter course credits: ").strip())  # Prompt credits as float
+    teacher_name = input("Enter teacher name: ").strip()  # Prompt teacher
+    classroom_id = input("Enter classroom id: ").strip()  # Prompt classroom id
+    spending = float(input("Enter spending: ").strip())  # Prompt spending as float
+    other_activities = input("Enter other activities: ").strip()  # Prompt activities
+
+    cursor.execute(f"""
+    INSERT INTO {t} VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (date_time_slot, course_name, course_credits, teacher_name, classroom_id, spending, other_activities))  # Parameterized insert
+    conn.commit()                               # Commit change
+    display_table(conn, t)                      # Show updated table
+
+def query_teacher(conn, table_name):            # Query courses taught by a teacher in a table
+    t = safe_table_name(table_name)             # Sanitize table name
+    cursor = conn.cursor()                      # Cursor for query
+    teacher = input("Enter teacher name: ").strip()  # Prompt teacher name
+    cursor.execute(f"SELECT course_name, COUNT(*) FROM {t} WHERE teacher_name=? GROUP BY course_name", (teacher,))  # Parameterized grouped query
+    rows = cursor.fetchall()                    # Fetch results
+    if not rows:                                # If none found
+        print("No classes found for that teacher.")  # Inform user
+        return
+    for course, count in rows:                   # Print each course and count
+        print(f"Course: {course}, Weekly Classes: {count}")
+
+# -------------------------------
+# C. Analytics module (all tables)
+# -------------------------------
+def analytics_all(conn, tables=None):           # Aggregated analytics across tables
+    cur = conn.cursor()                         # Cursor for queries
+    if tables is None:                          # If no explicit list provided
+        tables = get_all_tables(conn)           # Use all tables in DB
+    tables = [safe_table_name(t) for t in tables if t]  # Sanitize names
+
+    if not tables:                              # If still empty
+        print("No tables found to analyze.")    # Inform user
+        return
+
+    # Total spending over 5 days for all students (sum across tables)
+    total_spending_all = 0.0                    # Accumulator
+    for t in tables:                            # For each table
+        cur.execute(f"SELECT SUM(spending) FROM {t}")  # Sum spending
+        val = cur.fetchone()[0]                 # Get sum (may be None)
+        if val is not None:                     # If not null
+            total_spending_all += val           # Add to accumulator
+    print(f"\nTotal spending over 5 days for all students: {total_spending_all:.2f}")  # Print total
+
+    # Weekly frequency of each course (aggregated across tables)
+    course_counts = Counter()                   # Counter for course frequencies
+    for t in tables:                            # For each table
+        cur.execute(f"SELECT course_name, COUNT(*) FROM {t} GROUP BY course_name")  # Count per course
+        for course, cnt in cur.fetchall():      # Aggregate counts
+            if course is None:                  # Skip null course names
+                continue
+            course_counts[course] += cnt       # Add to counter
+    print("\nWeekly frequency of each course (all students):")  # Header
+    for course, cnt in course_counts.most_common():  # Print sorted by frequency
+        print(f"  {course}: {cnt}")
+
+    # Most frequently used classroom (across all tables)
+    classroom_list = []                         # Collect classroom ids
+    for t in tables:                            # For each table
+        cur.execute(f"SELECT classroom_id FROM {t}")  # Select classroom_id
+        classroom_list.extend([r[0] for r in cur.fetchall() if r[0] is not None])  # Extend list
+    if classroom_list:                          # If any data
+        most_used = Counter(classroom_list).most_common(1)[0]  # Top classroom
+        print(f"\nMost frequently used classroom across all students: {most_used[0]} ({most_used[1]} times)")  # Print result
+    else:
+        print("\nNo classroom data available.")  # No data message
+
+    # Most frequent activity in other_activities (across all tables)
+    activity_list = []                          # Collect activities
+    for t in tables:                            # For each table
+        cur.execute(f"SELECT other_activities FROM {t}")  # Select activities
+        activity_list.extend([r[0] for r in cur.fetchall() if r[0] is not None])  # Extend list
+    if activity_list:                           # If any data
+        most_activity = Counter(activity_list).most_common(1)[0]  # Top activity
+        print(f"\nMost frequent activity across all students: {most_activity[0]} ({most_activity[1]} times)")  # Print result
+    else:
+        print("\nNo activity data available.")  # No data message
+
+    # Average daily spending for each student (per-table)
+    print("\nAverage daily spending for each student:")  # Header
+    for t in tables:                            # For each table
+        cur.execute(f"""
+            SELECT substr(Date_time_slot,1,10) as day, SUM(spending) 
+            FROM {t} GROUP BY day
+        """)                                    # Sum spending per day
+        day_sums = [r[1] or 0.0 for r in cur.fetchall()]  # List of daily totals
+        if day_sums:                            # If any days
+            avg_daily = sum(day_sums) / len(day_sums)  # Compute average
+        else:
+            avg_daily = 0.0                     # Default zero
+        print(f"  {t}: {avg_daily:.2f}")        # Print per-table average
+
+# -------------------------------
+# D. Visualization module (charts)
+# -------------------------------
+def plot_line_daily_spending_all(conn, tables=None):  # Line chart: one line per student
+    if tables is None:                          # Default to all tables
+        tables = get_all_tables(conn)
+    tables = [safe_table_name(t) for t in tables if t]  # Sanitize names
+
+    if not tables:                              # If no tables
+        print("No tables to plot.")              # Inform user
+        return
+
+    cur = conn.cursor()                         # Cursor for queries
+    student_daily = {}                          # Map table -> {day: total}
+    all_days = set()                            # Union of all days
+    for t in tables:                            # For each table
+        cur.execute(f"SELECT substr(Date_time_slot,1,10) as day, SUM(spending) FROM {t} GROUP BY day ORDER BY day")  # Daily sums
+        rows = cur.fetchall()                   # Fetch rows
+        days = [r[0] for r in rows]             # Extract day strings
+        totals = [r[1] or 0.0 for r in rows]    # Extract totals
+        student_daily[t] = dict(zip(days, totals))  # Map day->total
+        all_days.update(days)                   # Add days to union
+
+    if not all_days:                            # If no spending data
+        print("No spending data to plot.")      # Inform user
+        return
+
+    all_days = sorted(all_days)                 # Sorted x-axis
+    plt.figure(figsize=(10,5))                  # Create figure
+    for student, day_map in student_daily.items():  # Plot each student's line
+        y = [day_map.get(d, 0.0) for d in all_days]  # Align totals to all_days
+        plt.plot(all_days, y, marker='o', label=student)  # Plot line with markers
+    plt.title("Daily total spending per student")  # Title
+    plt.xlabel("Day")                            # X label
+    plt.ylabel("Total spending")                 # Y label
+    plt.xticks(rotation=45)                      # Rotate x labels for readability
+    plt.legend()                                 # Show legend
+    plt.tight_layout()                           # Tight layout
+    plt.show()                                   # Display plot
+
+def plot_pie_course_per_student(conn, table_name):  # Pie chart: course distribution for one student
+    t = safe_table_name(table_name)               # Sanitize table name
+    cur = conn.cursor()                           # Cursor for query
+    cur.execute(f"SELECT course_name, COUNT(*) FROM {t} GROUP BY course_name")  # Count classes per course
+    rows = cur.fetchall()                         # Fetch results
+    if not rows:                                  # If no data
+        print(f"No course data for {table_name}.")  # Inform user
+        return
+    labels = [r[0] for r in rows]                 # Course names
+    sizes = [r[1] for r in rows]                  # Counts
+    plt.figure(figsize=(6,6))                     # Create figure
+    plt.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90)  # Draw pie
+    plt.title(f"Course distribution for {table_name}")  # Title
+    plt.tight_layout()                            # Tight layout
+    plt.show()                                    # Display plot
+
+def plot_bar_classroom_usage_all(conn, tables=None):  # Bar chart: classroom usage across students
+    if tables is None:                            # Default to all tables
+        tables = get_all_tables(conn)
+    tables = [safe_table_name(t) for t in tables if t]  # Sanitize names
+
+    cur = conn.cursor()                           # Cursor for queries
+    classrooms = []                               # Collect classroom ids
+    for t in tables:                              # For each table
+        cur.execute(f"SELECT classroom_id FROM {t}")  # Select classroom_id
+        classrooms.extend([r[0] for r in cur.fetchall() if r[0] is not None])  # Extend list
+
+    if not classrooms:                            # If no data
+        print("No classroom data to plot.")       # Inform user
+        return
+
+    freq = Counter(classrooms)                    # Frequency counts
+    labels = list(freq.keys())                    # Classroom labels
+    counts = list(freq.values())                  # Counts
+    plt.figure(figsize=(8,4))                     # Create figure
+    plt.bar(labels, counts, color='tab:blue')     # Draw bar chart
+    plt.title("Classroom usage frequency (all students)")  # Title
+    plt.xlabel("Classroom")                       # X label
+    plt.ylabel("Usage count")                     # Y label
+    plt.xticks(rotation=45)                       # Rotate labels
+    plt.tight_layout()                            # Tight layout
+    plt.show()                                    # Display plot
+
+# -------------------------------
+# Helper: choose or create student table
+# -------------------------------
+def list_tables(conn):                           # Wrapper to list tables
+    return get_all_tables(conn)                  # Return list of table names
+
+def choose_student_table(conn, default="Mary20254512"):  # Prompt user to pick or create a table
+    tables = list_tables(conn)                   # Get existing tables
+    if tables:                                   # If any exist
+        print("\nExisting tables:")              # Print header
+        for i, t in enumerate(tables, 1):        # Enumerate and print
+            print(f"{i}. {t}")
+    else:
+        print("\nNo tables found in the database yet.")  # Inform if none
+
+    print("\nChoose a table by number, or type a new student id (e.g. Mary20254512):")  # Prompt
+    choice = input("Enter number or student id (leave blank for default): ").strip()  # Read input
+    if not choice:                                # If blank
+        return default                            # Return default name
+    if choice.isdigit():                          # If numeric selection
+        idx = int(choice) - 1                     # Convert to 0-based index
+        if 0 <= idx < len(tables):                # If valid index
+            return tables[idx]                    # Return selected table
+        else:
+            print("Invalid number; using default.")  # Warn and fallback
+            return default
+    # Otherwise treat as table name (sanitize)
+    name = safe_table_name(choice)                 # Sanitize provided name
+    if not is_valid_student_table_name(name):      # Validate pattern
+        print("Warning: table name does not match studentname+ID pattern. It will still be created but consider using the format studentname+ID (e.g., Mary20254512).")  # Warn user
+    return name                                    # Return sanitized name
+
+# -------------------------------
+# Main Program
+# -------------------------------
+def main():                                       # Program entry point
+    conn = connect_db()                           # Open DB connection
+    try:
+        student_table = choose_student_table(conn)  # Let user choose or create table
+        create_table(conn, student_table)         # Ensure table exists
+        inserted = ensure_minimum_rows(conn, student_table)  # Ensure 20 rows
+        if inserted:                              # If prepopulated
+            print(f"Prepopulated 20 rows into {student_table} (Mon-Fri × 4 periods).")  # Notify
+
+        while True:                               # Main interactive loop
+            print(f"\nCurrent student table: {student_table}")  # Show current table
+            print("Menu:")                        # Menu header
+            print("1. Display Table")             # Option 1
+            print("2. Insert Record")             # Option 2
+            print("3. Query Teacher")             # Option 3
+            print("4. Analytics (all tables or selected)")  # Option 4
+            print("5. Visualization")             # Option 5
+            print("6. Switch Student Table")      # Option 6
+            print("7. Exit")                      # Option 7
+
+            choice = input("Enter choice: ").strip()  # Read user choice
+
+            if choice == "1":                     # Display table
+                display_table(conn, student_table)
+            elif choice == "2":                   # Insert record
+                insert_record(conn, student_table)
+            elif choice == "3":                   # Query teacher
+                query_teacher(conn, student_table)
+            elif choice == "4":                   # Analytics branch
+                # let user select tables to analyze
+                cur = conn.cursor()               # Cursor to list tables
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")  # Query tables
+                existing_tables = [r[0] for r in cur.fetchall()]  # Build list
+                print("Tables in DB:", existing_tables)  # Print available tables
+                sel = input("Enter 'all' or comma-separated table numbers/names (leave blank for current): ").strip()  # Prompt selection
+                if not sel:                        # Default to current table
+                    tables = [student_table]
+                elif sel.lower() == "all":         # All tables selected
+                    tables = existing_tables
+                else:
+                    parts = [p.strip() for p in sel.split(",")]  # Split input
+                    if all(p.isdigit() for p in parts):  # If numeric indices
+                        indices = [int(p)-1 for p in parts]  # Convert to 0-based
+                        tables = [existing_tables[i] for i in indices if 0 <= i < len(existing_tables)]  # Map indices
+                    else:
+                        # treat as names, keep only existing
+                        tables = [p for p in parts if p in existing_tables]  # Validate names
+                        if not tables:                   # If none matched
+                            print("No matching tables found; using current table.")  # Warn
+                            tables = [student_table]     # Fallback
+                analytics_all(conn, tables)           # Run analytics on chosen tables
+            elif choice == "5":                     # Visualization branch
+                # Visualization options
+                print("Visualization options:")
+                print(" a. Line chart: daily total spending for each student (all tables)")
+                print(" b. Pie chart: course distribution for a student")
+                print(" c. Bar chart: classroom usage frequency for all students")
+                sub = input("Choose a, b, or c: ").strip().lower()  # Read sub-choice
+                if sub == "a":                       # Line chart for all students
+                    plot_line_daily_spending_all(conn, None)
+                elif sub == "b":                     # Pie chart for one student
+                    cur = conn.cursor()
+                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                    existing_tables = [r[0] for r in cur.fetchall()]
+                    if not existing_tables:
+                        print("No tables available.")  # No tables to choose
+                    else:
+                        print("Available tables:")
+                        for i, t in enumerate(existing_tables, 1):
+                            print(f"{i}. {t}")       # List tables with indices
+                        sel = input("Enter table number or name for pie chart: ").strip()  # Prompt selection
+                        if sel.isdigit():           # If numeric
+                            idx = int(sel)-1
+                            if 0 <= idx < len(existing_tables):
+                                plot_pie_course_per_student(conn, existing_tables[idx])  # Plot selected
+                            else:
+                                print("Invalid selection.")  # Invalid index
+                        else:
+                            if sel in existing_tables:
+                                plot_pie_course_per_student(conn, sel)  # Plot by name
+                            else:
+                                print("Table not found.")  # Name not found
+                elif sub == "c":                     # Bar chart across all students
+                    plot_bar_classroom_usage_all(conn, None)
+                else:
+                    print("Invalid choice.")         # Invalid visualization option
+            elif choice == "6":                     # Switch current student table
+                student_table = choose_student_table(conn)  # Prompt for new table
+                create_table(conn, student_table)   # Ensure it exists
+                inserted = ensure_minimum_rows(conn, student_table)  # Ensure 20 rows
+                if inserted:
+                    print(f"Prepopulated 20 rows into {student_table} (Mon-Fri × 4 periods).")  # Notify
+            elif choice == "7":                     # Exit program
+                break                               # Break loop to exit
+            else:
+                print("Invalid choice, try again.")  # Handle unknown input
+    finally:
+        conn.close()                              # Always close DB connection on exit
+
+if __name__ == "__main__":                       # Run main only when executed directly
+    main()                                       # Start the interactive program
